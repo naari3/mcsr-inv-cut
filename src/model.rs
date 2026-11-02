@@ -218,13 +218,12 @@ fn fill_gaps(c: &mut [Class], class: Class, max_gap: usize) {
     let mut i = 0;
     while i < c.len() {
         if c[i] == class {
-            if let Some(e) = last_end {
-                if i - e - 1 <= max_gap && i > e + 1 {
+            if let Some(e) = last_end
+                && i - e - 1 <= max_gap && i > e + 1 {
                     for x in &mut c[e + 1..i] {
                         *x = class;
                     }
                 }
-            }
             while i < c.len() && c[i] == class {
                 i += 1;
             }
@@ -245,10 +244,11 @@ pub struct Segment {
 
 pub fn segments(classes: &[Class], range: (usize, usize)) -> Vec<Segment> {
     let mut out: Vec<Segment> = Vec::new();
-    for i in range.0..=range.1.min(classes.len().saturating_sub(1)) {
+    let end = range.1.min(classes.len().saturating_sub(1));
+    for (i, &class) in classes.iter().enumerate().take(end + 1).skip(range.0) {
         match out.last_mut() {
-            Some(s) if s.class == classes[i] && s.end + 1 == i => s.end = i,
-            _ => out.push(Segment { start: i, end: i, class: classes[i] }),
+            Some(seg) if seg.class == class && seg.end + 1 == i => seg.end = i,
+            _ => out.push(Segment { start: i, end: i, class }),
         }
     }
     out
@@ -271,35 +271,35 @@ impl Stats {
 }
 
 pub fn stats(p: &Project, classes: &[Class]) -> Stats {
-    let mut s = Stats::default();
+    let mut out = Stats::default();
     if p.frame_count() == 0 {
-        return s;
+        return out;
     }
-    let (a, b) = p.range();
-    for i in a..=b {
-        let d = p.frame_duration(i);
-        s.total += d;
-        match classes[i] {
-            Class::Container => s.container += d,
-            Class::OtherGui => s.other_gui += d,
-            Class::Game => s.game += d,
+    let (first, last) = p.range();
+    for (i, class) in classes.iter().enumerate().take(last + 1).skip(first) {
+        let dur = p.frame_duration(i);
+        out.total += dur;
+        match class {
+            Class::Container => out.container += dur,
+            Class::OtherGui => out.other_gui += dur,
+            Class::Game => out.game += dur,
         }
     }
-    s.frames = b - a + 1;
-    s.container_count = segments(classes, (a, b)).iter().filter(|x| x.class == Class::Container).count();
-    s
+    out.frames = last - first + 1;
+    out.container_count = segments(classes, (first, last)).iter().filter(|x| x.class == Class::Container).count();
+    out
 }
 
 pub fn fmt_time(t: f64) -> String {
     let neg = t < 0.0;
     let t = t.abs();
-    let ms = (t * 1000.0).round() as u64;
-    let (h, m, s, ms) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000);
+    let total_ms = crate::num::to_u64((t * 1000.0).round());
+    let (hours, mins, secs, ms) = (total_ms / 3_600_000, total_ms / 60_000 % 60, total_ms / 1000 % 60, total_ms % 1000);
     let sign = if neg { "-" } else { "" };
-    if h > 0 {
-        format!("{sign}{h}:{m:02}:{s:02}.{ms:03}")
+    if hours > 0 {
+        format!("{sign}{hours}:{mins:02}:{secs:02}.{ms:03}")
     } else {
-        format!("{sign}{m:02}:{s:02}.{ms:03}")
+        format!("{sign}{mins:02}:{secs:02}.{ms:03}")
     }
 }
 
@@ -326,7 +326,7 @@ mod tests {
             overrides: vec![],
             range: None,
             analyzed_roi: None,
-            pts: (0..10).map(|i| i as f64 / 10.0).collect(),
+            pts: (0..10).map(|i| f64::from(i) / 10.0).collect(),
             keyframes: vec![],
             features: vec![Features::default(); 10],
         };
@@ -348,7 +348,7 @@ mod tests {
             overrides: vec![],
             range: None,
             analyzed_roi: None,
-            pts: (0..10).map(|i| i as f64 / 10.0).collect(),
+            pts: (0..10).map(|i| f64::from(i) / 10.0).collect(),
             keyframes: vec![],
             features: vec![Features::default(); 10],
         };

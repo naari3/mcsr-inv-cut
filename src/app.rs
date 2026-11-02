@@ -2,6 +2,7 @@ use crate::analysis::{self, AnalysisResult, Progress};
 use crate::detect::{self, PanelRect, Roi};
 use crate::export::{self, CutMode, EncodeOptions};
 use crate::model::{Class, Project, Segment, Stats, fmt_time, segments, stats};
+use crate::num::{f32_from, f32_from_f64, ratio, to_usize};
 use crate::preview::{Preview, PreviewFrame, Source};
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ fn class_color(c: Class) -> Color32 {
 }
 
 enum JobOutput {
-    Opened(Project),
+    Opened(Box<Project>),
     Analyzed(AnalysisResult),
     Exported(PathBuf),
 }
@@ -70,7 +71,7 @@ impl App {
             texture: None,
             shown: None,
             shown_panels: Vec::new(),
-            shown_features: Default::default(),
+            shown_features: detect::Features::default(),
             job: None,
             view: (0.0, 1.0),
             selection: None,
@@ -117,7 +118,7 @@ impl App {
             }
         }
         let progress = Progress::new();
-        let handle = std::thread::spawn(move || Ok(JobOutput::Opened(Project::from_video(&path)?)));
+        let handle = std::thread::spawn(move || Ok(JobOutput::Opened(Box::new(Project::from_video(&path)?))));
         self.job = Some(Job { label: "動画を読み込み中", progress, handle: Some(handle) });
     }
 
@@ -174,14 +175,14 @@ impl App {
     }
 
     fn poll_job(&mut self) {
-        let finished = self.job.as_ref().is_some_and(|j| j.handle.as_ref().is_some_and(|h| h.is_finished()));
+        let finished = self.job.as_ref().is_some_and(|j| j.handle.as_ref().is_some_and(std::thread::JoinHandle::is_finished));
         if !finished {
             return;
         }
         let mut job = self.job.take().unwrap();
         match job.handle.take().unwrap().join() {
             Ok(Ok(JobOutput::Opened(p))) => {
-                self.set_project(p);
+                self.set_project(*p);
             }
             Ok(Ok(JobOutput::Analyzed(r))) => {
                 if let Some(p) = &mut self.project {
@@ -223,7 +224,7 @@ impl App {
                     match &mut self.texture {
                         Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                         None => {
-                            self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR))
+                            self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR));
                         }
                     }
                     self.shown = Some(f);
@@ -242,18 +243,11 @@ impl App {
         }
     }
 
-    fn segment_at(&self, i: usize) -> Option<Segment> {
-        let p = self.project.as_ref()?;
-        let c = *self.classes.get(i)?;
-        let mut a = i;
-        while a > 0 && self.classes[a - 1] == c {
-            a -= 1;
-        }
-        let mut b = i;
-        while b + 1 < p.frame_count() && self.classes[b + 1] == c {
-            b += 1;
-        }
-        Some(Segment { start: a, end: b, class: c })
+    fn segment_at(&self, frame: usize) -> Option<Segment> {
+        let class = *self.classes.get(frame)?;
+        let start = self.classes[..frame].iter().rposition(|&other| other != class).map_or(0, |pos| pos + 1);
+        let end = self.classes[frame..].iter().position(|&other| other != class).map_or(self.classes.len(), |pos| frame + pos) - 1;
+        Some(Segment { start, end, class })
     }
 
     fn apply_override(&mut self, class: Option<Class>) {
@@ -357,13 +351,13 @@ impl App {
             }
             ui.separator();
             if let Some(job) = &self.job {
-                let p = &job.progress;
-                let (d, t) = (p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed));
-                let frac = if t > 0 { d as f32 / t as f32 } else { 0.0 };
+                let progress = &job.progress;
+                let done = progress.done.load(Ordering::Relaxed);
+                let total = progress.total.load(Ordering::Relaxed);
                 ui.label(job.label);
-                ui.add(egui::ProgressBar::new(frac).desired_width(240.0).show_percentage());
+                ui.add(egui::ProgressBar::new(ratio(done, total)).desired_width(240.0).show_percentage());
                 if ui.button("キャンセル").clicked() {
-                    p.cancel.store(true, Ordering::Relaxed);
+                    progress.cancel.store(true, Ordering::Relaxed);
                 }
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             }
@@ -373,238 +367,264 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let idle = self.job.is_none();
-            let Some(p) = &mut self.project else { return };
-            let mut changed = false;
-            let mut roi_changed = false;
-
-            ui.heading("解析");
-            ui.label(format!("{}x{} / {:.3} fps (平均)", p.info.width, p.info.height, p.info.avg_fps));
-            ui.label(format!("{} フレーム", p.frame_count()));
-            ui.horizontal(|ui| {
-                ui.toggle_value(&mut self.roi_edit, "解析範囲を描く").on_hover_text("ゲーム画面だけを囲う");
-                if ui.button("解析範囲を全体に戻す").clicked() {
-                    p.roi = Roi::default();
-                    roi_changed = true;
-                }
-            });
-            let analyze_label = if !p.analyzed() {
-                "解析する"
-            } else if p.analyzed_roi.is_some_and(|r| r != p.roi) {
-                "解析範囲を反映して再解析"
-            } else {
-                "再解析"
-            };
-            let analyze_clicked = ui.add_enabled(idle, egui::Button::new(analyze_label)).clicked();
-
+            if self.project.is_none() {
+                return;
+            }
+            self.analysis_section(ui);
             ui.separator();
-            ui.heading("判定");
-            let s = &mut p.settings;
-            changed |= ui
-                .add(egui::Slider::new(&mut s.panel_threshold, 0.001..=0.2).logarithmic(true).text("パネル面積しきい値"))
-                .changed();
-            changed |= ui.checkbox(&mut s.detect_other_gui, "その他GUI を判定").changed();
-            ui.add_enabled_ui(s.detect_other_gui, |ui| {
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut s.red_threshold, 0.000001..=0.01)
-                            .logarithmic(true)
-                            .text("ハート赤しきい値"),
-                    )
-                    .changed();
-            });
-            changed |= ui
-                .add(egui::Slider::new(&mut s.fill_gap_frames, 0..=10).text("コンテナ間の穴埋め (フレーム)"))
-                .changed();
-
+            self.settings_section(ui);
             ui.separator();
-            ui.heading("現在フレーム");
-            let i = self.current;
-            ui.label(format!("#{i}  {}", fmt_time(p.pts[i] - p.info.start_time)));
-            if let Some(f) = p.features.get(i) {
-                ui.label(format!("panel {:.4}  red {:.6}  bright {:.3}", f.panel, f.red, f.bright));
-                let auto = p.auto_classes()[i];
-                let fin = self.classes[i];
-                ui.colored_label(class_color(fin), fin.label());
-                if auto != fin {
-                    ui.small(format!("✏ 手動修正 (自動判定は{})", auto.label()));
-                }
-            }
-
+            self.frame_section(ui);
             ui.separator();
-            ui.heading("計測");
-            let (a, b) = p.range();
-            ui.label(format!(
-                "#{a} {} 〜 #{b} {}",
-                fmt_time(p.pts[a] - p.info.start_time),
-                fmt_time(p.frame_end_time(b) - p.info.start_time)
-            ));
-            let (mut range_start, mut range_end) = (false, false);
-            ui.horizontal(|ui| {
-                range_start = ui.button("ここから計測").on_hover_text("I").clicked();
-                range_end = ui.button("ここまで計測").on_hover_text("O").clicked();
-                if ui.button("範囲を全体に戻す").clicked() {
-                    p.range = None;
-                    changed = true;
-                }
-            });
-            let st = &self.stats;
-            let text = format!(
-                "全体: {}\nコンテナGUI: {} ({} 回)\nコンテナGUI以外: {}\n  うちその他GUI: {}\n  うちゲーム画面: {}",
-                fmt_time(st.total),
-                fmt_time(st.container),
-                st.container_count,
-                fmt_time(st.non_container()),
-                fmt_time(st.other_gui),
-                fmt_time(st.game),
-            );
-            ui.label(egui::RichText::new(&text).monospace().size(15.0));
-            if ui.button("結果をコピー").clicked() {
-                ui.ctx().copy_text(text);
-            }
-
+            self.measure_section(ui);
             ui.separator();
-            ui.heading("区間");
-            ui.horizontal(|ui| {
-                for (label, f) in [
-                    ("コンテナ", Some(Class::Container)),
-                    ("その他GUI", Some(Class::OtherGui)),
-                    ("すべて", None),
-                ] {
-                    ui.selectable_value(&mut self.segment_filter, f, label);
-                }
-            });
-            let segs: Vec<Segment> = segments(&self.classes, p.range())
-                .into_iter()
-                .filter(|s| self.segment_filter.is_none_or(|c| c == s.class))
-                .collect();
-            let mut seek_to = None;
-            egui::ScrollArea::vertical().id_salt("segs").max_height(220.0).show_rows(
-                ui,
-                18.0,
-                segs.len(),
-                |ui, rows| {
-                    for s in &segs[rows] {
-                        let d = p.frame_end_time(s.end) - p.pts[s.start];
-                        let txt = format!(
-                            "{}  {}  {:>7.3}s  {}f",
-                            fmt_time(p.pts[s.start] - p.info.start_time),
-                            s.class.label(),
-                            d,
-                            s.end - s.start + 1
-                        );
-                        let sel = self.selection == Some((s.start, s.end));
-                        if ui
-                            .add(egui::Button::selectable(sel, egui::RichText::new(txt).monospace().color(class_color(s.class))))
-                            .clicked()
-                        {
-                            seek_to = Some(*s);
-                        }
-                    }
-                },
-            );
-            if let Some(s) = seek_to {
-                self.selection = Some((s.start, s.end));
-                self.current = s.start;
-            }
-
+            self.segments_section(ui);
             ui.separator();
-            ui.heading("手動修正");
-            let mut apply: Option<Option<Class>> = None;
-            if let Some((a, b)) = self.selection {
-                ui.label(format!("#{a} 〜 #{b} ({} フレーム)", b - a + 1));
-            }
-            ui.add_enabled_ui(self.selection.is_some(), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for (label, key, c) in [
-                        ("コンテナGUIにする", "1", Some(Class::Container)),
-                        ("その他GUIにする", "2", Some(Class::OtherGui)),
-                        ("ゲーム画面にする", "3", Some(Class::Game)),
-                        ("自動判定に戻す", "0", None),
-                    ] {
-                        if ui.button(label).on_hover_text(key).clicked() {
-                            apply = Some(c);
-                        }
-                    }
-                });
-            })
-            .response
-            .on_disabled_hover_text("タイムラインを Shift+ドラッグ / ダブルクリック");
-            let mut remove = None;
-            for (k, o) in p.overrides.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.colored_label(class_color(o.class), format!("#{} 〜 #{}  {}", o.start, o.end, o.class.label()));
-                    if ui.small_button("取り消す").clicked() {
-                        remove = Some(k);
-                    }
-                });
-            }
-            if let Some(k) = remove {
-                p.overrides.remove(k);
-                changed = true;
-            }
-
+            self.corrections_section(ui);
             ui.separator();
-            ui.heading("書き出し");
-            egui::ComboBox::from_label("カット")
-                .selected_text(self.cut_mode.label())
-                .show_ui(ui, |ui| {
-                    for m in [CutMode::RemoveContainer, CutMode::RemoveAllGui, CutMode::OnlyContainer] {
-                        ui.selectable_value(&mut self.cut_mode, m, m.label());
-                    }
-                });
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut self.crf).range(0..=51).prefix("CRF "));
-                egui::ComboBox::from_id_salt("preset").selected_text(&self.preset).show_ui(ui, |ui| {
-                    for x in ["ultrafast", "veryfast", "fast", "medium", "slow"] {
-                        ui.selectable_value(&mut self.preset, x.to_string(), x);
-                    }
-                });
-            });
-            let mut export_video = None;
-            let mut export_csv = None;
-            ui.horizontal(|ui| {
-                if ui.add_enabled(idle, egui::Button::new("動画を書き出し")).clicked() {
-                    export_video = rfd::FileDialog::new()
-                        .set_file_name(default_name(&p.video, "_cut.mp4"))
-                        .add_filter("mp4", &["mp4"])
-                        .save_file();
-                }
-                if ui.button("CSV を書き出し").clicked() {
-                    export_csv = rfd::FileDialog::new()
-                        .set_file_name(default_name(&p.video, "_segments.csv"))
-                        .add_filter("csv", &["csv"])
-                        .save_file();
-                }
-            });
+            self.export_section(ui);
+        });
+    }
 
-            if roi_changed {
-                self.update_shown_detection();
-            }
-            if range_start || range_end {
-                self.set_range_edge(range_start);
-            }
-            if let Some(c) = apply {
-                self.apply_override(c);
-            }
-            if analyze_clicked {
-                self.start_analysis();
-            }
-            if changed {
-                self.recompute();
-                self.save();
-            }
-            if let Some(out) = export_video {
-                self.start_export(out);
-            }
-            if let Some(out) = export_csv {
-                let p = self.project.as_ref().unwrap();
-                self.status = match export::write_csv(p, &self.classes, &out) {
-                    Ok(()) => format!("CSV を書き出した: {}", out.display()),
-                    Err(e) => format!("CSV 書き出しに失敗: {e:#}"),
-                };
+    fn changed(&mut self) {
+        self.recompute();
+        self.save();
+    }
+
+    fn analysis_section(&mut self, ui: &mut egui::Ui) {
+        let idle = self.job.is_none();
+        let Some(p) = &mut self.project else { return };
+        ui.heading("解析");
+        ui.label(format!("{}x{} / {:.3} fps (平均)", p.info.width, p.info.height, p.info.avg_fps));
+        ui.label(format!("{} フレーム", p.frame_count()));
+        let mut roi_reset = false;
+        ui.horizontal(|ui| {
+            ui.toggle_value(&mut self.roi_edit, "解析範囲を描く").on_hover_text("ゲーム画面だけを囲う");
+            if ui.button("解析範囲を全体に戻す").clicked() {
+                p.roi = Roi::default();
+                roi_reset = true;
             }
         });
+        let analyze_label = if !p.analyzed() {
+            "解析する"
+        } else if p.analyzed_roi.is_some_and(|roi| roi != p.roi) {
+            "解析範囲を反映して再解析"
+        } else {
+            "再解析"
+        };
+        let analyze = ui.add_enabled(idle, egui::Button::new(analyze_label)).clicked();
+        if roi_reset {
+            self.update_shown_detection();
+        }
+        if analyze {
+            self.start_analysis();
+        }
+    }
+
+    fn settings_section(&mut self, ui: &mut egui::Ui) {
+        let Some(p) = &mut self.project else { return };
+        let settings = &mut p.settings;
+        let mut changed = false;
+        ui.heading("判定");
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut settings.panel_threshold, 0.001..=0.2)
+                    .logarithmic(true)
+                    .text("パネル面積しきい値"),
+            )
+            .changed();
+        changed |= ui.checkbox(&mut settings.detect_other_gui, "その他GUI を判定").changed();
+        ui.add_enabled_ui(settings.detect_other_gui, |ui| {
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut settings.red_threshold, 0.000_001..=0.01)
+                        .logarithmic(true)
+                        .text("ハート赤しきい値"),
+                )
+                .changed();
+        });
+        changed |= ui
+            .add(egui::Slider::new(&mut settings.fill_gap_frames, 0..=10).text("コンテナ間の穴埋め (フレーム)"))
+            .changed();
+        if changed {
+            self.changed();
+        }
+    }
+
+    fn frame_section(&self, ui: &mut egui::Ui) {
+        let Some(p) = &self.project else { return };
+        let idx = self.current;
+        ui.heading("現在フレーム");
+        ui.label(format!("#{idx}  {}", fmt_time(p.pts[idx] - p.info.start_time)));
+        if let Some(feat) = p.features.get(idx) {
+            ui.label(format!("panel {:.4}  red {:.6}  bright {:.3}", feat.panel, feat.red, feat.bright));
+            let auto = p.auto_classes()[idx];
+            let fin = self.classes[idx];
+            ui.colored_label(class_color(fin), fin.label());
+            if auto != fin {
+                ui.small(format!("✏ 手動修正 (自動判定は{})", auto.label()));
+            }
+        }
+    }
+
+    fn measure_section(&mut self, ui: &mut egui::Ui) {
+        let Some(p) = &mut self.project else { return };
+        ui.heading("計測");
+        let (first, last) = p.range();
+        ui.label(format!(
+            "#{first} {} 〜 #{last} {}",
+            fmt_time(p.pts[first] - p.info.start_time),
+            fmt_time(p.frame_end_time(last) - p.info.start_time)
+        ));
+        let (mut set_start, mut set_end, mut reset) = (false, false, false);
+        ui.horizontal(|ui| {
+            set_start = ui.button("ここから計測").on_hover_text("I").clicked();
+            set_end = ui.button("ここまで計測").on_hover_text("O").clicked();
+            reset = ui.button("範囲を全体に戻す").clicked();
+        });
+        let st = &self.stats;
+        let text = format!(
+            "全体: {}\nコンテナGUI: {} ({} 回)\nコンテナGUI以外: {}\n  うちその他GUI: {}\n  うちゲーム画面: {}",
+            fmt_time(st.total),
+            fmt_time(st.container),
+            st.container_count,
+            fmt_time(st.non_container()),
+            fmt_time(st.other_gui),
+            fmt_time(st.game),
+        );
+        ui.label(egui::RichText::new(&text).monospace().size(15.0));
+        if ui.button("結果をコピー").clicked() {
+            ui.ctx().copy_text(text);
+        }
+        if reset {
+            p.range = None;
+            self.changed();
+        } else if set_start || set_end {
+            self.set_range_edge(set_start);
+        }
+    }
+
+    fn segments_section(&mut self, ui: &mut egui::Ui) {
+        let Some(p) = &self.project else { return };
+        ui.heading("区間");
+        ui.horizontal(|ui| {
+            for (label, filter) in [
+                ("コンテナ", Some(Class::Container)),
+                ("その他GUI", Some(Class::OtherGui)),
+                ("すべて", None),
+            ] {
+                ui.selectable_value(&mut self.segment_filter, filter, label);
+            }
+        });
+        let segs: Vec<Segment> = segments(&self.classes, p.range())
+            .into_iter()
+            .filter(|seg| self.segment_filter.is_none_or(|class| class == seg.class))
+            .collect();
+        let mut picked = None;
+        egui::ScrollArea::vertical().id_salt("segs").max_height(220.0).show_rows(ui, 18.0, segs.len(), |ui, rows| {
+            for seg in &segs[rows] {
+                let txt = format!(
+                    "{}  {}  {:>7.3}s  {}f",
+                    fmt_time(p.pts[seg.start] - p.info.start_time),
+                    seg.class.label(),
+                    p.frame_end_time(seg.end) - p.pts[seg.start],
+                    seg.end - seg.start + 1
+                );
+                let selected = self.selection == Some((seg.start, seg.end));
+                let label = egui::RichText::new(txt).monospace().color(class_color(seg.class));
+                if ui.add(egui::Button::selectable(selected, label)).clicked() {
+                    picked = Some(*seg);
+                }
+            }
+        });
+        if let Some(seg) = picked {
+            self.selection = Some((seg.start, seg.end));
+            self.current = seg.start;
+        }
+    }
+
+    fn corrections_section(&mut self, ui: &mut egui::Ui) {
+        let Some(p) = &mut self.project else { return };
+        ui.heading("手動修正");
+        if let Some((first, last)) = self.selection {
+            ui.label(format!("#{first} 〜 #{last} ({} フレーム)", last - first + 1));
+        }
+        let mut apply: Option<Option<Class>> = None;
+        ui.add_enabled_ui(self.selection.is_some(), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (label, key, class) in [
+                    ("コンテナGUIにする", "1", Some(Class::Container)),
+                    ("その他GUIにする", "2", Some(Class::OtherGui)),
+                    ("ゲーム画面にする", "3", Some(Class::Game)),
+                    ("自動判定に戻す", "0", None),
+                ] {
+                    if ui.button(label).on_hover_text(key).clicked() {
+                        apply = Some(class);
+                    }
+                }
+            });
+        })
+        .response
+        .on_disabled_hover_text("タイムラインを Shift+ドラッグ / ダブルクリック");
+        let mut remove = None;
+        for (pos, o) in p.overrides.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.colored_label(class_color(o.class), format!("#{} 〜 #{}  {}", o.start, o.end, o.class.label()));
+                if ui.small_button("取り消す").clicked() {
+                    remove = Some(pos);
+                }
+            });
+        }
+        if let Some(pos) = remove {
+            p.overrides.remove(pos);
+            self.changed();
+        }
+        if let Some(class) = apply {
+            self.apply_override(class);
+        }
+    }
+
+    fn export_section(&mut self, ui: &mut egui::Ui) {
+        let idle = self.job.is_none();
+        let Some(p) = &self.project else { return };
+        ui.heading("書き出し");
+        egui::ComboBox::from_label("カット").selected_text(self.cut_mode.label()).show_ui(ui, |ui| {
+            for mode in [CutMode::RemoveContainer, CutMode::RemoveAllGui, CutMode::OnlyContainer] {
+                ui.selectable_value(&mut self.cut_mode, mode, mode.label());
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut self.crf).range(0..=51).prefix("CRF "));
+            egui::ComboBox::from_id_salt("preset").selected_text(&self.preset).show_ui(ui, |ui| {
+                for preset in ["ultrafast", "veryfast", "fast", "medium", "slow"] {
+                    ui.selectable_value(&mut self.preset, preset.to_string(), preset);
+                }
+            });
+        });
+        let (mut export_video, mut export_csv) = (None, None);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(idle, egui::Button::new("動画を書き出し")).clicked() {
+                export_video = rfd::FileDialog::new()
+                    .set_file_name(default_name(&p.video, "_cut.mp4"))
+                    .add_filter("mp4", &["mp4"])
+                    .save_file();
+            }
+            if ui.button("CSV を書き出し").clicked() {
+                export_csv = rfd::FileDialog::new()
+                    .set_file_name(default_name(&p.video, "_segments.csv"))
+                    .add_filter("csv", &["csv"])
+                    .save_file();
+            }
+        });
+        if let Some(out) = export_csv {
+            self.status = match export::write_csv(p, &self.classes, &out) {
+                Ok(()) => format!("CSV を書き出した: {}", out.display()),
+                Err(e) => format!("CSV 書き出しに失敗: {e:#}"),
+            };
+        }
+        if let Some(out) = export_video {
+            self.start_export(out);
+        }
     }
 
     fn preview_ui(&mut self, ui: &mut egui::Ui) {
@@ -619,19 +639,18 @@ impl App {
             }
             return;
         };
-        let ts = tex.size_vec2();
-        let scale = (avail.x / ts.x).min(avail.y / ts.y);
-        let size = ts * scale;
+        let tex_size = tex.size_vec2();
+        let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
         let (rect, resp) = ui.allocate_exact_size(avail, Sense::drag());
-        let img_rect = Rect::from_center_size(rect.center(), size);
+        let img_rect = Rect::from_center_size(rect.center(), tex_size * scale);
         let painter = ui.painter_at(rect);
         painter.image(tex.id(), img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
 
-        let to_norm = |p: Pos2| {
-            let v = (p - img_rect.min) / img_rect.size();
-            pos2(v.x.clamp(0.0, 1.0), v.y.clamp(0.0, 1.0))
+        let to_norm = |pos: Pos2| {
+            let rel = (pos - img_rect.min) / img_rect.size();
+            pos2(rel.x.clamp(0.0, 1.0), rel.y.clamp(0.0, 1.0))
         };
-        let from_norm = |x: f32, y: f32| img_rect.min + vec2(x, y) * img_rect.size();
+        let from_norm = |nx: f32, ny: f32| img_rect.min + vec2(nx, ny) * img_rect.size();
 
         let Some(p) = &mut self.project else { return };
         let roi = p.roi;
@@ -641,14 +660,17 @@ impl App {
             Stroke::new(1.5, Color32::from_rgb(80, 200, 255)),
             StrokeKind::Inside,
         );
-        if let Some(f) = &self.shown {
-            for r in &self.shown_panels {
-                let a = from_norm(r.x0 as f32 / f.w as f32, r.y0 as f32 / f.h as f32);
-                let b = from_norm((r.x1 + 1) as f32 / f.w as f32, (r.y1 + 1) as f32 / f.h as f32);
-                painter.rect_stroke(Rect::from_min_max(a, b), 0.0, Stroke::new(2.0, C_CONTAINER), StrokeKind::Outside);
+        if let Some(frame) = &self.shown {
+            let (fw, fh) = (f32_from(frame.w as usize), f32_from(frame.h as usize));
+            for panel in &self.shown_panels {
+                let top_left = from_norm(f32_from(panel.x0) / fw, f32_from(panel.y0) / fh);
+                let bottom_right = from_norm(f32_from(panel.x1 + 1) / fw, f32_from(panel.y1 + 1) / fh);
+                let stroke = Stroke::new(2.0, C_CONTAINER);
+                painter.rect_stroke(Rect::from_min_max(top_left, bottom_right), 0.0, stroke, StrokeKind::Outside);
             }
-            if f.index != self.current {
-                painter.text(rect.left_top() + vec2(8.0, 8.0), egui::Align2::LEFT_TOP, "読み込み中…", egui::FontId::proportional(16.0), Color32::YELLOW);
+            if frame.index != self.current {
+                let font = egui::FontId::proportional(16.0);
+                painter.text(rect.left_top() + vec2(8.0, 8.0), egui::Align2::LEFT_TOP, "読み込み中…", font, Color32::YELLOW);
             }
         }
 
@@ -657,11 +679,12 @@ impl App {
                 self.roi_drag = resp.interact_pointer_pos();
             }
             if let (Some(start), Some(now)) = (self.roi_drag, resp.interact_pointer_pos()) {
-                painter.rect_stroke(Rect::from_two_pos(start, now), 0.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
+                let stroke = Stroke::new(1.5, Color32::WHITE);
+                painter.rect_stroke(Rect::from_two_pos(start, now), 0.0, stroke, StrokeKind::Inside);
                 if resp.drag_stopped() {
-                    let (a, b) = (to_norm(start), to_norm(now));
-                    if (a.x - b.x).abs() > 0.02 && (a.y - b.y).abs() > 0.02 {
-                        p.roi = Roi { x0: a.x.min(b.x), y0: a.y.min(b.y), x1: a.x.max(b.x), y1: a.y.max(b.y) };
+                    let (from, to) = (to_norm(start), to_norm(now));
+                    if (from.x - to.x).abs() > 0.02 && (from.y - to.y).abs() > 0.02 {
+                        p.roi = Roi { x0: from.x.min(to.x), y0: from.y.min(to.y), x1: from.x.max(to.x), y1: from.y.max(to.y) };
                         self.roi_edit = false;
                     }
                     self.roi_drag = None;
@@ -673,176 +696,208 @@ impl App {
 
     fn timeline_ui(&mut self, ui: &mut egui::Ui) {
         let Some(p) = &self.project else { return };
-        let n = p.frame_count();
-        let t_min = p.pts[0];
-        let t_max = p.frame_end_time(n - 1);
         let width = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(vec2(width, 150.0), Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
+        let t_min = p.pts[0];
+        let t_max = p.frame_end_time(p.frame_count() - 1);
+        self.view = zoom_and_pan(ui, &resp, rect, self.view, (t_min, t_max), 30.0 / p.info.avg_fps);
+        let axis = TimeAxis { left: rect.left(), width, start: self.view.0, end: self.view.1 };
+        self.paint_timeline(&ui.painter_at(rect), rect, &axis);
+        self.timeline_input(ui, &resp, &axis);
+        resp.on_hover_text(
+            "🖱 ドラッグでシーク\n⇧ Shift+ドラッグで範囲選択\n🖱 ダブルクリックで区間を選択\n🔍 ホイールでズーム\n↔ 右ドラッグでスクロール\n⏵ ← → で 1 フレーム、Shift で区間の境界へ",
+        );
+    }
+
+    fn paint_timeline(&self, painter: &egui::Painter, rect: Rect, axis: &TimeAxis) {
+        let Some(p) = &self.project else { return };
         painter.rect_filled(rect, 0.0, Color32::from_gray(20));
-
-        // Zoom with the wheel around the pointer, pan with right/middle drag.
-        let (mut v0, mut v1) = self.view;
-        if let Some(hover) = resp.hover_pos() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta);
-            let tp = v0 + (hover.x - rect.left()) as f64 / width as f64 * (v1 - v0);
-            if scroll.y != 0.0 {
-                let k = (-scroll.y as f64 / 200.0).exp();
-                let len = ((v1 - v0) * k).clamp(30.0 / p.info.avg_fps, t_max - t_min);
-                v0 = tp - (tp - v0) / (v1 - v0) * len;
-                v1 = v0 + len;
-            }
-            if scroll.x != 0.0 {
-                let d = -scroll.x as f64 / width as f64 * (v1 - v0);
-                v0 += d;
-                v1 += d;
-            }
-        }
-        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
-            let d = -resp.drag_delta().x as f64 / width as f64 * (v1 - v0);
-            v0 += d;
-            v1 += d;
-        }
-        let len = v1 - v0;
-        if v0 < t_min {
-            (v0, v1) = (t_min, t_min + len);
-        }
-        if v1 > t_max {
-            (v0, v1) = ((t_max - len).max(t_min), t_max);
-        }
-        self.view = (v0, v1);
-        let x_of = |t: f64| rect.left() + ((t - v0) / (v1 - v0) * width as f64) as f32;
-        let t_of = |x: f32| v0 + (x - rect.left()) as f64 / width as f64 * (v1 - v0);
-
-        // Rows.
-        let ruler = Rect::from_min_size(rect.min, vec2(width, 16.0));
-        let auto_row = Rect::from_min_size(rect.min + vec2(0.0, 18.0), vec2(width, 8.0));
-        let final_row = Rect::from_min_size(rect.min + vec2(0.0, 28.0), vec2(width, 26.0));
-        let panel_row = Rect::from_min_size(rect.min + vec2(0.0, 58.0), vec2(width, 44.0));
-        let red_row = Rect::from_min_size(rect.min + vec2(0.0, 106.0), vec2(width, 40.0));
+        let row = |top: f32, height: f32| Rect::from_min_size(rect.min + vec2(0.0, top), vec2(axis.width, height));
+        let (ruler, auto_row, final_row) = (row(0.0, 16.0), row(18.0, 8.0), row(28.0, 26.0));
+        let (panel_row, red_row) = (row(58.0, 44.0), row(106.0, 40.0));
 
         // Ruler ticks.
         let steps = [0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0];
-        let step = *steps.iter().find(|s| (v1 - v0) / **s < width as f64 / 90.0).unwrap_or(&1800.0);
-        let mut t = ((v0 - p.info.start_time) / step).ceil() * step + p.info.start_time;
-        while t < v1 {
-            let x = x_of(t);
+        let span = axis.end - axis.start;
+        let step = steps.iter().copied().find(|s| span / s < f64::from(axis.width) / 90.0).unwrap_or(1800.0);
+        let mut tick = ((axis.start - p.info.start_time) / step).ceil() * step + p.info.start_time;
+        while tick < axis.end {
+            let x = axis.x_of(tick);
             painter.line_segment([pos2(x, ruler.top()), pos2(x, ruler.bottom())], Stroke::new(1.0, Color32::GRAY));
-            painter.text(pos2(x + 2.0, ruler.top()), egui::Align2::LEFT_TOP, fmt_time(t - p.info.start_time), egui::FontId::monospace(10.0), Color32::LIGHT_GRAY);
-            t += step;
+            let label = fmt_time(tick - p.info.start_time);
+            painter.text(pos2(x + 2.0, ruler.top()), egui::Align2::LEFT_TOP, label, egui::FontId::monospace(10.0), Color32::LIGHT_GRAY);
+            tick += step;
         }
 
         // Per pixel column summaries.
         let auto = p.auto_classes();
-        let prio = |c: Class| match c {
+        let prio = |class: Class| match class {
             Class::Container => 2,
             Class::OtherGui => 1,
             Class::Game => 0,
         };
-        let log_red = |r: f32| ((r.max(1e-6).log10() + 6.0) / 4.0).clamp(0.0, 1.0);
-        let panel_norm = |v: f32| (v / 0.3).clamp(0.0, 1.0).sqrt();
-        let cols = width.ceil() as usize;
-        for col in 0..cols {
-            let ct0 = t_of(rect.left() + col as f32);
-            let ct1 = t_of(rect.left() + col as f32 + 1.0);
-            if ct0 >= t_max {
+        let log_red = |red: f32| ((red.max(1e-6).log10() + 6.0) / 4.0).clamp(0.0, 1.0);
+        let panel_norm = |panel: f32| (panel / 0.3).clamp(0.0, 1.0).sqrt();
+        let t_max = p.frame_end_time(p.frame_count() - 1);
+        let bar = |row: Rect, x: f32, frac: f32| Rect::from_min_max(pos2(x, row.bottom() - frac * row.height()), pos2(x + 1.0, row.bottom()));
+        for col in 0..to_usize(f64::from(axis.width).ceil()) {
+            let x = rect.left() + f32_from(col);
+            let (col_start, col_end) = (axis.t_of(x), axis.t_of(x + 1.0));
+            if col_start >= t_max {
                 break;
             }
             // Every frame overlapping this column; a frame wider than a column
             // paints all the columns it covers.
-            let fa = p.frame_at_time(ct0);
-            let fb = p.frame_at_time(ct1).max(fa);
-            let (mut ca, mut cf) = (auto[fa], self.classes[fa]);
-            let (mut pmax, mut rmin) = (0.0f32, 1.0f32);
-            for i in fa..=fb {
-                if prio(auto[i]) > prio(ca) {
-                    ca = auto[i];
+            let first = p.frame_at_time(col_start);
+            let last = p.frame_at_time(col_end).max(first);
+            let (mut auto_class, mut final_class) = (auto[first], self.classes[first]);
+            let (mut panel_max, mut red_min) = (0.0f32, 1.0f32);
+            for (idx, (&a_class, &f_class)) in auto.iter().zip(&self.classes).enumerate().take(last + 1).skip(first) {
+                if prio(a_class) > prio(auto_class) {
+                    auto_class = a_class;
                 }
-                if prio(self.classes[i]) > prio(cf) {
-                    cf = self.classes[i];
+                if prio(f_class) > prio(final_class) {
+                    final_class = f_class;
                 }
-                if let Some(f) = p.features.get(i) {
-                    pmax = pmax.max(f.panel);
-                    rmin = rmin.min(f.red);
+                if let Some(feat) = p.features.get(idx) {
+                    panel_max = panel_max.max(feat.panel);
+                    red_min = red_min.min(feat.red);
                 }
             }
-            let x = rect.left() + col as f32;
-            let colr = |r: Rect| Rect::from_min_max(pos2(x, r.top()), pos2(x + 1.0, r.bottom()));
-            painter.rect_filled(colr(auto_row), 0.0, class_color(ca).gamma_multiply(0.7));
-            painter.rect_filled(colr(final_row), 0.0, class_color(cf));
+            painter.rect_filled(bar(auto_row, x, 1.0), 0.0, class_color(auto_class).gamma_multiply(0.7));
+            painter.rect_filled(bar(final_row, x, 1.0), 0.0, class_color(final_class));
             if p.analyzed() {
-                let h = panel_norm(pmax) * panel_row.height();
-                painter.rect_filled(Rect::from_min_max(pos2(x, panel_row.bottom() - h), pos2(x + 1.0, panel_row.bottom())), 0.0, C_CONTAINER.gamma_multiply(0.8));
-                let h = log_red(rmin) * red_row.height();
-                painter.rect_filled(Rect::from_min_max(pos2(x, red_row.bottom() - h), pos2(x + 1.0, red_row.bottom())), 0.0, Color32::from_rgb(200, 60, 60));
+                painter.rect_filled(bar(panel_row, x, panel_norm(panel_max)), 0.0, C_CONTAINER.gamma_multiply(0.8));
+                painter.rect_filled(bar(red_row, x, log_red(red_min)), 0.0, Color32::from_rgb(200, 60, 60));
             }
         }
+
         // Threshold lines.
-        let s = &p.settings;
-        let y = panel_row.bottom() - panel_norm(s.panel_threshold) * panel_row.height();
-        painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(1.0, Color32::WHITE));
-        if s.detect_other_gui {
-            let y = red_row.bottom() - log_red(s.red_threshold) * red_row.height();
-            painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(1.0, Color32::WHITE));
+        let settings = &p.settings;
+        let hline = |y: f32| painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(1.0, Color32::WHITE));
+        hline(panel_row.bottom() - panel_norm(settings.panel_threshold) * panel_row.height());
+        if settings.detect_other_gui {
+            hline(red_row.bottom() - log_red(settings.red_threshold) * red_row.height());
         }
-        painter.text(panel_row.left_top() + vec2(4.0, 0.0), egui::Align2::LEFT_TOP, "panel", egui::FontId::monospace(10.0), Color32::WHITE);
-        painter.text(red_row.left_top() + vec2(4.0, 0.0), egui::Align2::LEFT_TOP, "heart red (log)", egui::FontId::monospace(10.0), Color32::WHITE);
+        let small = egui::FontId::monospace(10.0);
+        painter.text(panel_row.left_top() + vec2(4.0, 0.0), egui::Align2::LEFT_TOP, "panel", small.clone(), Color32::WHITE);
+        painter.text(red_row.left_top() + vec2(4.0, 0.0), egui::Align2::LEFT_TOP, "heart red (log)", small, Color32::WHITE);
 
         // Measured range shading.
-        let (ra, rb) = p.range();
+        let (first, last) = p.range();
         let dim = Color32::from_black_alpha(150);
-        let xa = x_of(p.pts[ra]);
-        let xb = x_of(p.frame_end_time(rb));
-        if xa > rect.left() {
-            painter.rect_filled(Rect::from_min_max(rect.min, pos2(xa.min(rect.right()), rect.bottom())), 0.0, dim);
+        let x_first = axis.x_of(p.pts[first]);
+        let x_last = axis.x_of(p.frame_end_time(last));
+        if x_first > rect.left() {
+            painter.rect_filled(Rect::from_min_max(rect.min, pos2(x_first.min(rect.right()), rect.bottom())), 0.0, dim);
         }
-        if xb < rect.right() {
-            painter.rect_filled(Rect::from_min_max(pos2(xb.max(rect.left()), rect.top()), rect.max), 0.0, dim);
+        if x_last < rect.right() {
+            painter.rect_filled(Rect::from_min_max(pos2(x_last.max(rect.left()), rect.top()), rect.max), 0.0, dim);
         }
 
         // Selection.
-        if let Some((a, b)) = self.selection {
-            let r = Rect::from_min_max(pos2(x_of(p.pts[a]), rect.top()), pos2(x_of(p.frame_end_time(b)).max(x_of(p.pts[a]) + 1.0), rect.bottom()));
-            painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40));
-            painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
+        if let Some((sel_first, sel_last)) = self.selection {
+            let x_start = axis.x_of(p.pts[sel_first]);
+            let x_end = axis.x_of(p.frame_end_time(sel_last)).max(x_start + 1.0);
+            let sel = Rect::from_min_max(pos2(x_start, rect.top()), pos2(x_end, rect.bottom()));
+            painter.rect_filled(sel, 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40));
+            painter.rect_stroke(sel, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
         }
 
         // Playhead.
-        let xc = x_of(p.pts[self.current]);
-        let xe = x_of(p.frame_end_time(self.current)).max(xc + 1.0);
-        painter.rect_filled(Rect::from_min_max(pos2(xc, rect.top()), pos2(xe, rect.bottom())), 0.0, Color32::from_rgba_unmultiplied(255, 60, 60, 160));
+        let x_cur = axis.x_of(p.pts[self.current]);
+        let x_next = axis.x_of(p.frame_end_time(self.current)).max(x_cur + 1.0);
+        let head = Rect::from_min_max(pos2(x_cur, rect.top()), pos2(x_next, rect.bottom()));
+        painter.rect_filled(head, 0.0, Color32::from_rgba_unmultiplied(255, 60, 60, 160));
+    }
 
-        // Interaction.
-        let shift = ui.input(|i| i.modifiers.shift);
-        let frame_at = |x: f32| p.frame_at_time(t_of(x));
+    fn timeline_input(&mut self, ui: &egui::Ui, resp: &egui::Response, axis: &TimeAxis) {
+        let Some(p) = &self.project else { return };
+        let shift = ui.input(|input| input.modifiers.shift);
         if let Some(pos) = resp.interact_pointer_pos() {
-            let f = frame_at(pos.x);
+            let frame = p.frame_at_time(axis.t_of(pos.x));
             if resp.double_clicked() {
-                if let Some(s) = self.segment_at(f) {
-                    self.selection = Some((s.start, s.end));
+                if let Some(seg) = self.segment_at(frame) {
+                    self.selection = Some((seg.start, seg.end));
                 }
             } else if resp.drag_started_by(egui::PointerButton::Primary) || resp.clicked() {
                 if shift {
-                    self.drag_anchor = Some(f);
-                    self.selection = Some((f, f));
+                    self.drag_anchor = Some(frame);
+                    self.selection = Some((frame, frame));
                 } else {
                     self.drag_anchor = None;
                 }
-                self.current = f;
+                self.current = frame;
             } else if resp.dragged_by(egui::PointerButton::Primary) {
-                if let Some(a) = self.drag_anchor {
-                    self.selection = Some((a.min(f), a.max(f)));
+                if let Some(anchor) = self.drag_anchor {
+                    self.selection = Some((anchor.min(frame), anchor.max(frame)));
                 }
-                self.current = f;
+                self.current = frame;
             }
         }
         if resp.drag_stopped() {
             self.drag_anchor = None;
         }
-        resp.on_hover_text(
-            "🖱 ドラッグでシーク\n⇧ Shift+ドラッグで範囲選択\n🖱 ダブルクリックで区間を選択\n🔍 ホイールでズーム\n↔ 右ドラッグでスクロール\n⏵ ← → で 1 フレーム、Shift で区間の境界へ",
-        );
     }
+}
+
+/// Maps between timeline time (seconds) and screen x.
+struct TimeAxis {
+    left: f32,
+    width: f32,
+    start: f64,
+    end: f64,
+}
+
+impl TimeAxis {
+    fn x_of(&self, t: f64) -> f32 {
+        self.left + f32_from_f64((t - self.start) / (self.end - self.start) * f64::from(self.width))
+    }
+
+    fn t_of(&self, x: f32) -> f64 {
+        self.start + f64::from(x - self.left) / f64::from(self.width) * (self.end - self.start)
+    }
+}
+
+/// Zooms with the wheel around the pointer and pans with horizontal scroll or
+/// right/middle drag. Returns the new visible time range, kept within `bounds`.
+fn zoom_and_pan(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    rect: Rect,
+    (mut start, mut end): (f64, f64),
+    (t_min, t_max): (f64, f64),
+    min_span: f64,
+) -> (f64, f64) {
+    let width = f64::from(rect.width());
+    if let Some(hover) = resp.hover_pos() {
+        let scroll = ui.input(|input| input.smooth_scroll_delta);
+        let pointer = start + f64::from(hover.x - rect.left()) / width * (end - start);
+        if scroll.y != 0.0 {
+            let factor = (f64::from(-scroll.y) / 200.0).exp();
+            let span = ((end - start) * factor).clamp(min_span, t_max - t_min);
+            start = pointer - (pointer - start) / (end - start) * span;
+            end = start + span;
+        }
+        if scroll.x != 0.0 {
+            let shift = f64::from(-scroll.x) / width * (end - start);
+            start += shift;
+            end += shift;
+        }
+    }
+    if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+        let shift = f64::from(-resp.drag_delta().x) / width * (end - start);
+        start += shift;
+        end += shift;
+    }
+    let span = end - start;
+    if start < t_min {
+        (start, end) = (t_min, t_min + span);
+    }
+    if end > t_max {
+        (start, end) = ((t_max - span).max(t_min), t_max);
+    }
+    (start, end)
 }
 
 fn default_name(video: &Path, suffix: &str) -> String {
@@ -851,7 +906,7 @@ fn default_name(video: &Path, suffix: &str) -> String {
 }
 
 fn install_japanese_font(ctx: &egui::Context) {
-    let dir = std::env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows")).join("Fonts");
+    let dir = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join("Fonts");
     for name in ["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"] {
         if let Ok(data) = std::fs::read(dir.join(name)) {
             ctx.add_font(egui::epaint::text::FontInsert::new(

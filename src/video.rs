@@ -55,8 +55,8 @@ pub fn probe(path: &Path) -> Result<VideoInfo> {
         .or_else(|| vs["r_frame_rate"].as_str().and_then(parse_rate))
         .unwrap_or(60.0);
     Ok(VideoInfo {
-        width: vs["width"].as_u64().unwrap_or(0) as u32,
-        height: vs["height"].as_u64().unwrap_or(0) as u32,
+        width: vs["width"].as_u64().and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+        height: vs["height"].as_u64().and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
         start_time: num(&v["format"]["start_time"]).unwrap_or(0.0),
         duration: num(&v["format"]["duration"]).unwrap_or(0.0),
         avg_fps,
@@ -104,9 +104,9 @@ pub fn frame_index(path: &Path) -> Result<(Vec<f64>, Vec<usize>)> {
 
 /// Output size of the analysis decode: width fixed, aspect kept, even height.
 pub fn analysis_size(info: &VideoInfo, width: u32) -> (u32, u32) {
-    let w = width.min(info.width.max(2)) & !1;
-    let h = ((info.height as f64 * w as f64 / info.width.max(1) as f64).round() as u32).max(2) & !1;
-    (w, h)
+    let out_w = width.min(info.width.max(2)) & !1;
+    let scaled = f64::from(info.height) * f64::from(out_w) / f64::from(info.width.max(1));
+    (out_w, crate::num::to_u32(scaled.round()).max(2) & !1)
 }
 
 /// Streams every frame as packed RGB24 at the given size.

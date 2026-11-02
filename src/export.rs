@@ -1,6 +1,7 @@
 use crate::model::{Class, Project, Segment, fmt_time, segments, stats};
 use crate::video;
 use anyhow::{Context, Result, bail};
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::Stdio;
@@ -113,7 +114,7 @@ pub fn cut_video(
         bail!("残る区間がない");
     }
     let total: f64 = keep.iter().map(|(a, b)| b - a).sum();
-    progress.total.store((total * 1000.0) as usize, Ordering::Relaxed);
+    progress.total.store(crate::num::to_usize(total * 1000.0), Ordering::Relaxed);
     progress.done.store(0, Ordering::Relaxed);
 
     // Timestamps sit exactly on frame boundaries, so test against the middle of the
@@ -134,9 +135,7 @@ pub fn cut_video(
     );
     if p.info.has_audio {
         // Audio frames hold ~1024 samples; split them small so cuts land within ~1 ms.
-        graph.push_str(&format!(
-            ";[0:a:0]asetnsamples=n=32:p=0,aselect='{expr}',asetpts=N/SR/TB[a]"
-        ));
+        let _ = write!(graph, ";[0:a:0]asetnsamples=n=32:p=0,aselect='{expr}',asetpts=N/SR/TB[a]");
     }
 
     let script = out.with_extension("filter.txt");
@@ -172,11 +171,10 @@ pub fn cut_video(
             let _ = child.kill();
             break;
         }
-        if let Some(v) = line.strip_prefix("out_time_us=") {
-            if let Ok(us) = v.trim().parse::<i64>() {
-                progress.done.store((us.max(0) / 1000) as usize, Ordering::Relaxed);
+        if let Some(v) = line.strip_prefix("out_time_us=")
+            && let Ok(us) = v.trim().parse::<i64>() {
+                progress.done.store(usize::try_from(us / 1000).unwrap_or(0), Ordering::Relaxed);
             }
-        }
     }
     let status = child.wait()?;
     let err = err_thread.join().unwrap_or_default();

@@ -28,7 +28,7 @@ fn with_progress<T: Send>(label: &str, f: impl FnOnce(&Progress) -> Result<T> + 
             std::thread::sleep(std::time::Duration::from_millis(500));
             let (d, t) = (progress.done.load(Ordering::Relaxed), progress.total.load(Ordering::Relaxed));
             if t > 0 {
-                eprint!("\r{label}: {:5.1}%", d as f64 / t as f64 * 100.0);
+                eprint!("\r{label}: {:5.1}%", crate::num::ratio(d, t) * 100.0);
             }
         }
         eprintln!();

@@ -101,13 +101,12 @@ impl Worker {
             if !self.drain() {
                 return;
             }
-            if let Some(t) = self.target {
-                if let Err(e) = self.produce(t) {
+            if let Some(t) = self.target
+                && let Err(e) = self.produce(t) {
                     self.target = None;
                     self.reader = None;
                     self.send(Err(e));
                 }
-            }
         }
     }
 
@@ -162,57 +161,58 @@ impl Worker {
         }
     }
 
-    /// Decodes until frame `t` is available, giving up early when a newer request
-    /// arrives (the next loop iteration continues from where the reader is).
-    fn produce(&mut self, t: usize) -> Result<()> {
-        if let Some(rgb) = self.cache.get(&t).cloned() {
+    /// Decodes until frame `want` is available, giving up early when a newer
+    /// request arrives (the next loop iteration continues from where the reader is).
+    fn produce(&mut self, want: usize) -> Result<()> {
+        if let Some(rgb) = self.cache.get(&want).cloned() {
             self.target = None;
-            self.send(Ok(self.frame(t, rgb)));
+            self.send(Ok(self.frame(want, rgb)));
             return Ok(());
         }
         let Some(src) = &self.source else {
             self.target = None;
             return Ok(());
         };
-        let (w, h) = self.size;
-        let keyframe = match src.keyframes.partition_point(|&k| k <= t) {
+        let (width, height) = self.size;
+        let keyframe = match src.keyframes.partition_point(|&key| key <= want) {
             0 => None,
-            n => Some(src.keyframes[n - 1]),
+            count => Some(src.keyframes[count - 1]),
         };
-        let Some(k) = keyframe else {
+        let Some(key) = keyframe else {
             // No keyframe information: decode the frame on its own.
-            let rgb = Arc::new(video::grab_frame(&src.path, &src.info, src.pts[t], w, h)?);
-            self.insert(t, rgb.clone());
+            let rgb = Arc::new(video::grab_frame(&src.path, &src.info, src.pts[want], width, height)?);
+            self.insert(want, rgb.clone());
             self.target = None;
-            self.send(Ok(self.frame(t, rgb)));
+            self.send(Ok(self.frame(want, rgb)));
             return Ok(());
         };
 
-        let reuse = self.reader.is_some() && self.next <= t && (self.next >= k || t - self.next <= MAX_READ_AHEAD);
+        let reuse =
+            self.reader.is_some() && self.next <= want && (self.next >= key || want - self.next <= MAX_READ_AHEAD);
         let restarted = !reuse;
         if restarted {
-            let ss = src.pts[k] - src.info.start_time - 0.0005;
-            self.reader = Some(FrameReader::open(&src.path, w, h, Some(ss))?);
-            self.next = k;
+            let seek = src.pts[key] - src.info.start_time - 0.0005;
+            self.reader = Some(FrameReader::open(&src.path, width, height, Some(seek))?);
+            self.next = key;
         }
         let mut buf = Vec::new();
-        while self.next <= t {
+        while self.next <= want {
             let Some(reader) = self.reader.as_mut() else { bail!("reader closed") };
             if !reader.next_frame(&mut buf)? {
                 self.reader = None;
-                bail!("フレーム #{t} を読めなかった");
+                bail!("フレーム #{want} を読めなかった");
             }
-            let i = self.next;
+            let index = self.next;
             self.next += 1;
             let rgb = Arc::new(std::mem::take(&mut buf));
-            self.insert(i, rgb.clone());
+            self.insert(index, rgb.clone());
             // After a jump, show the keyframe right away while decoding onwards.
-            if restarted && i == k && i != t {
-                self.send(Ok(self.frame(i, rgb)));
+            if restarted && index == key && index != want {
+                self.send(Ok(self.frame(index, rgb)));
             }
-            if i == t {
+            if index == want {
                 self.target = None;
-                self.send(Ok(self.frame(t, self.cache[&t].clone())));
+                self.send(Ok(self.frame(want, self.cache[&want].clone())));
                 return Ok(());
             }
             if !self.rx.is_empty() {

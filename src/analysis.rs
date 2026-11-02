@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub const ANALYSIS_WIDTH: u32 = 960;
+/// Frames analyzed together on the rayon pool.
+const BATCH: usize = 48;
 
 pub struct Progress {
     pub done: AtomicUsize,
@@ -36,7 +38,6 @@ pub fn run(path: &Path, info: &VideoInfo, roi: Roi, progress: &Progress) -> Resu
     let (w, h) = video::analysis_size(info, ANALYSIS_WIDTH);
     let mut reader = FrameReader::open(path, w, h, None)?;
 
-    const BATCH: usize = 48;
     let mut features = Vec::with_capacity(pts.len());
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH);
     let mut spare: Vec<Vec<u8>> = Vec::new();
@@ -66,7 +67,7 @@ pub fn run(path: &Path, info: &VideoInfo, roi: Roi, progress: &Progress) -> Resu
     if pts.len() != features.len() {
         let dt = 1.0 / info.avg_fps;
         let t0 = pts.first().copied().unwrap_or(info.start_time);
-        pts = (0..features.len()).map(|i| t0 + i as f64 * dt).collect();
+        pts = (0..features.len()).map(|i| t0 + crate::num::f64_from(i) * dt).collect();
     }
     Ok(AnalysisResult { pts, features })
 }

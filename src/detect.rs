@@ -8,6 +8,7 @@
 //!   therefore vanish whenever any screen is open. `red` is the fraction of
 //!   heart-red pixels; `bright` is the fraction of bright pixels outside panels.
 
+use crate::num::{f32_from, ratio};
 use serde::{Deserialize, Serialize};
 
 /// Region of interest in normalized source coordinates (0..1).
@@ -26,11 +27,13 @@ impl Default for Roi {
 }
 
 impl Roi {
-    pub fn pixels(&self, w: u32, h: u32) -> (usize, usize, usize, usize) {
-        let cx = |v: f32| ((v.clamp(0.0, 1.0) * w as f32).round() as usize).min(w as usize);
-        let cy = |v: f32| ((v.clamp(0.0, 1.0) * h as f32).round() as usize).min(h as usize);
-        let (x0, x1) = (cx(self.x0.min(self.x1)), cx(self.x0.max(self.x1)));
-        let (y0, y1) = (cy(self.y0.min(self.y1)), cy(self.y0.max(self.y1)));
+    pub fn pixels(&self, width: u32, height: u32) -> (usize, usize, usize, usize) {
+        let to_px = |v: f32, size: u32| {
+            let size = size as usize;
+            crate::num::to_usize(f64::from(v.clamp(0.0, 1.0) * f32_from(size)).round()).min(size)
+        };
+        let (x0, x1) = (to_px(self.x0.min(self.x1), width), to_px(self.x0.max(self.x1), width));
+        let (y0, y1) = (to_px(self.y0.min(self.y1), height), to_px(self.y0.max(self.y1), height));
         (x0, y0, x1.max(x0 + 1), y1.max(y0 + 1))
     }
 }
@@ -49,20 +52,18 @@ const PANEL: i32 = 198;
 const PANEL_TOL: i32 = 14;
 
 #[inline]
-fn is_panel(r: u8, g: u8, b: u8) -> bool {
-    (r as i32 - PANEL).abs() <= PANEL_TOL
-        && (g as i32 - PANEL).abs() <= PANEL_TOL
-        && (b as i32 - PANEL).abs() <= PANEL_TOL
+fn is_panel(px: [u8; 3]) -> bool {
+    px.iter().all(|&c| (i32::from(c) - PANEL).abs() <= PANEL_TOL)
 }
 
 #[inline]
-fn is_heart_red(r: u8, g: u8, b: u8) -> bool {
-    r >= 190 && g <= 70 && b <= 70
+fn is_heart_red([red, green, blue]: [u8; 3]) -> bool {
+    red >= 190 && green <= 70 && blue <= 70
 }
 
 #[inline]
-fn luma(r: u8, g: u8, b: u8) -> u32 {
-    (r as u32 * 3 + g as u32 * 6 + b as u32) / 10
+fn luma([red, green, blue]: [u8; 3]) -> u32 {
+    (u32::from(red) * 3 + u32::from(green) * 6 + u32::from(blue)) / 10
 }
 
 /// Detected panel rectangle in ROI pixel coordinates (inclusive bounds).
@@ -74,84 +75,93 @@ pub struct PanelRect {
     pub y1: usize,
 }
 
-fn find(parent: &mut [u32], mut x: u32) -> u32 {
-    while parent[x as usize] != x {
-        parent[x as usize] = parent[parent[x as usize] as usize];
-        x = parent[x as usize];
+fn find(parent: &mut [u32], mut label: u32) -> u32 {
+    while parent[label as usize] != label {
+        parent[label as usize] = parent[parent[label as usize] as usize];
+        label = parent[label as usize];
     }
-    x
+    label
 }
 
-/// Finds axis-aligned #C6C6C6 rectangles in an ROI-sized mask. `bright` marks
-/// bright non-panel pixels, used to check that the world around a panel is dimmed.
-pub fn find_panels(mask: &[bool], bright: &[bool], w: usize, h: usize) -> Vec<PanelRect> {
-    // Two-pass connected component labeling (4-connectivity) with union-find.
-    let mut labels = vec![0u32; w * h];
+/// Connected components of `mask` (4-connectivity): per-pixel root labels (0 is
+/// background), and per label its area and bounding box.
+struct Components {
+    labels: Vec<u32>,
+    area: Vec<u32>,
+    bbox: Vec<(usize, usize, usize, usize)>,
+}
+
+fn label_components(mask: &[bool], width: usize, height: usize) -> Components {
+    // Two-pass labeling with union-find.
+    let mut labels = vec![0u32; width * height];
     let mut parent: Vec<u32> = vec![0];
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            if !mask[i] {
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            if !mask[idx] {
                 continue;
             }
-            let up = if y > 0 { labels[i - w] } else { 0 };
-            let left = if x > 0 { labels[i - 1] } else { 0 };
-            labels[i] = match (up, left) {
+            let up = if y > 0 { labels[idx - width] } else { 0 };
+            let left = if x > 0 { labels[idx - 1] } else { 0 };
+            labels[idx] = match (up, left) {
                 (0, 0) => {
-                    let l = parent.len() as u32;
-                    parent.push(l);
-                    l
+                    let new = u32::try_from(parent.len()).expect("fewer than 2^32 components");
+                    parent.push(new);
+                    new
                 }
-                (a, 0) | (0, a) => a,
-                (a, b) => {
-                    let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-                    if ra != rb {
-                        parent[ra.max(rb) as usize] = ra.min(rb);
+                (only, 0) | (0, only) => only,
+                (up, left) => {
+                    let (root_up, root_left) = (find(&mut parent, up), find(&mut parent, left));
+                    if root_up != root_left {
+                        parent[root_up.max(root_left) as usize] = root_up.min(root_left);
                     }
-                    ra.min(rb)
+                    root_up.min(root_left)
                 }
             };
         }
     }
-    let n = parent.len();
-    let mut area = vec![0u32; n];
-    let mut bb = vec![(usize::MAX, usize::MAX, 0usize, 0usize); n];
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            if labels[i] == 0 {
+    let count = parent.len();
+    let mut area = vec![0u32; count];
+    let mut bbox = vec![(usize::MAX, usize::MAX, 0usize, 0usize); count];
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            if labels[idx] == 0 {
                 continue;
             }
-            let r = find(&mut parent, labels[i]);
-            labels[i] = r;
-            area[r as usize] += 1;
-            let b = &mut bb[r as usize];
-            b.0 = b.0.min(x);
-            b.1 = b.1.min(y);
-            b.2 = b.2.max(x);
-            b.3 = b.3.max(y);
+            let root = find(&mut parent, labels[idx]);
+            labels[idx] = root;
+            area[root as usize] += 1;
+            let bb = &mut bbox[root as usize];
+            *bb = (bb.0.min(x), bb.1.min(y), bb.2.max(x), bb.3.max(y));
         }
     }
+    Components { labels, area, bbox }
+}
 
-    let min_w = (w as f32 * 0.05).max(8.0) as usize;
-    let min_h = (h as f32 * 0.05).max(8.0) as usize;
+/// Finds axis-aligned #C6C6C6 rectangles in an ROI-sized mask. `bright` marks
+/// bright non-panel pixels, used to check that the world around a panel is dimmed.
+pub fn find_panels(mask: &[bool], bright: &[bool], width: usize, height: usize) -> Vec<PanelRect> {
+    let comps = label_components(mask, width, height);
+    let min_w = (width / 20).max(8);
+    let min_h = (height / 20).max(8);
+    let debug = std::env::var_os("MCSR_DEBUG").is_some();
     let mut out = Vec::new();
-    for l in 1..n {
-        if area[l] == 0 {
+    for (lab, (&area, &(x0, y0, x1, y1))) in (0u32..).zip(comps.area.iter().zip(&comps.bbox)).skip(1) {
+        if area == 0 {
             continue;
         }
-        let (x0, y0, x1, y1) = bb[l];
         let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
         if bw < min_w || bh < min_h {
             continue;
         }
         // GUI panels sit inside the screen; flat blocks close to the camera usually
         // run off its edge.
-        if x0 == 0 || y0 == 0 || x1 == w - 1 || y1 == h - 1 {
+        if x0 == 0 || y0 == 0 || x1 == width - 1 || y1 == height - 1 {
             continue;
         }
         // Slots cover most of a chest panel, so the flat part can be well under half.
-        let fill = area[l] as f32 / (bw * bh) as f32;
+        let fill = ratio(area as usize, bw * bh);
         if fill < 0.12 {
             continue;
         }
@@ -159,20 +169,20 @@ pub fn find_panels(mask: &[bool], bright: &[bool], w: usize, h: usize) -> Vec<Pa
         // almost entirely panel colored. Inset by 1 to tolerate rounded corners
         // and scaling blur. Tooltips can cover two whole edges (and even split the
         // panel), so require one straight horizontal and one straight vertical edge.
-        let lab = l as u32;
-        let row_cov = |y: usize| {
-            (x0 + 2..=x1.saturating_sub(2)).filter(|&x| labels[y * w + x] == lab).count() as f32
-                / (bw.saturating_sub(4).max(1)) as f32
+        let labels = &comps.labels;
+        let row_cov = |row: usize| {
+            let hits = (x0 + 2..=x1.saturating_sub(2)).filter(|&col| labels[row * width + col] == lab).count();
+            ratio(hits, bw.saturating_sub(4).max(1))
         };
-        let col_cov = |x: usize| {
-            (y0 + 2..=y1.saturating_sub(2)).filter(|&y| labels[y * w + x] == lab).count() as f32
-                / (bh.saturating_sub(4).max(1)) as f32
+        let col_cov = |col: usize| {
+            let hits = (y0 + 2..=y1.saturating_sub(2)).filter(|&row| labels[row * width + col] == lab).count();
+            ratio(hits, bh.saturating_sub(4).max(1))
         };
         let top = row_cov(y0 + 1).max(row_cov(y0 + 2));
         let bottom = row_cov(y1 - 1).max(row_cov(y1 - 2));
         let left = col_cov(x0 + 1).max(col_cov(x0 + 2));
         let right = col_cov(x1 - 1).max(col_cov(x1 - 2));
-        if std::env::var_os("MCSR_DEBUG").is_some() {
+        if debug {
             eprintln!("cand {x0},{y0}-{x1},{y1} fill={fill:.2} t={top:.2} b={bottom:.2} l={left:.2} r={right:.2}");
         }
         if top.max(bottom) < 0.85 || left.max(right) < 0.85 {
@@ -180,8 +190,8 @@ pub fn find_panels(mask: &[bool], bright: &[bool], w: usize, h: usize) -> Vec<Pa
         }
         // Screens dim the world behind them, so a band just outside the panel is
         // mostly dark. Tooltips, toasts and overlays leave some bright pixels.
-        let ring = ring_bright_fraction(bright, w, h, (x0, y0, x1, y1));
-        if std::env::var_os("MCSR_DEBUG").is_some() {
+        let ring = ring_bright_fraction(bright, width, height, (x0, y0, x1, y1));
+        if debug {
             eprintln!("  ring_bright={ring:.3}");
         }
         if ring > 0.15 {
@@ -192,64 +202,61 @@ pub fn find_panels(mask: &[bool], bright: &[bool], w: usize, h: usize) -> Vec<Pa
     out
 }
 
-fn ring_bright_fraction(bright: &[bool], w: usize, h: usize, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> f32 {
-    let inner = (w / 320).max(2);
-    let outer = inner + (w / 80).max(6);
+fn ring_bright_fraction(bright: &[bool], width: usize, height: usize, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> f32 {
+    let inner = (width / 320).max(2);
+    let outer = inner + (width / 80).max(6);
     let (ox0, oy0) = (x0.saturating_sub(outer), y0.saturating_sub(outer));
-    let (ox1, oy1) = ((x1 + outer).min(w - 1), (y1 + outer).min(h - 1));
+    let (ox1, oy1) = ((x1 + outer).min(width - 1), (y1 + outer).min(height - 1));
     let (ix0, iy0) = (x0.saturating_sub(inner), y0.saturating_sub(inner));
-    let (ix1, iy1) = ((x1 + inner).min(w - 1), (y1 + inner).min(h - 1));
-    let (mut n, mut b) = (0u32, 0u32);
-    for y in oy0..=oy1 {
-        for x in ox0..=ox1 {
-            if (ix0..=ix1).contains(&x) && (iy0..=iy1).contains(&y) {
+    let (ix1, iy1) = ((x1 + inner).min(width - 1), (y1 + inner).min(height - 1));
+    let (mut total, mut lit) = (0usize, 0usize);
+    for row in oy0..=oy1 {
+        for col in ox0..=ox1 {
+            if (ix0..=ix1).contains(&col) && (iy0..=iy1).contains(&row) {
                 continue;
             }
-            n += 1;
-            b += bright[y * w + x] as u32;
+            total += 1;
+            lit += usize::from(bright[row * width + col]);
         }
     }
-    if n == 0 { 0.0 } else { b as f32 / n as f32 }
+    ratio(lit, total)
 }
 
-/// Computes features of one RGB24 frame of size `w`x`h`.
-pub fn analyze(rgb: &[u8], w: u32, h: u32, roi: &Roi) -> Features {
-    analyze_detail(rgb, w, h, roi).0
+/// Computes features of one RGB24 frame of size `width`x`height`.
+pub fn analyze(rgb: &[u8], width: u32, height: u32, roi: &Roi) -> Features {
+    analyze_detail(rgb, width, height, roi).0
 }
 
 /// Like [`analyze`], also returning the detected panels in frame pixel coordinates.
-pub fn analyze_detail(rgb: &[u8], w: u32, h: u32, roi: &Roi) -> (Features, Vec<PanelRect>) {
-    let (x0, y0, x1, y1) = roi.pixels(w, h);
+pub fn analyze_detail(rgb: &[u8], width: u32, height: u32, roi: &Roi) -> (Features, Vec<PanelRect>) {
+    let (x0, y0, x1, y1) = roi.pixels(width, height);
+    let stride = width as usize;
     let (rw, rh) = (x1 - x0, y1 - y0);
     let mut mask = vec![false; rw * rh];
     let mut bright_mask = vec![false; rw * rh];
-    let mut red = 0u32;
-    let mut bright = 0u32;
-    for y in 0..rh {
-        let row = &rgb[((y + y0) * w as usize + x0) * 3..((y + y0) * w as usize + x1) * 3];
-        for x in 0..rw {
-            let (r, g, b) = (row[x * 3], row[x * 3 + 1], row[x * 3 + 2]);
-            let p = is_panel(r, g, b);
-            mask[y * rw + x] = p;
-            if is_heart_red(r, g, b) {
+    let mut red = 0usize;
+    let mut bright = 0usize;
+    for row in 0..rh {
+        let line = &rgb[((row + y0) * stride + x0) * 3..((row + y0) * stride + x1) * 3];
+        for (col, px) in line.chunks_exact(3).enumerate() {
+            let px = [px[0], px[1], px[2]];
+            let panel = is_panel(px);
+            mask[row * rw + col] = panel;
+            if is_heart_red(px) {
                 red += 1;
             }
-            if !p && luma(r, g, b) >= 110 {
-                bright_mask[y * rw + x] = true;
+            if !panel && luma(px) >= 110 {
+                bright_mask[row * rw + col] = true;
                 bright += 1;
             }
         }
     }
-    let total = (rw * rh) as f32;
+    let total = rw * rh;
     let panels: Vec<PanelRect> = find_panels(&mask, &bright_mask, rw, rh)
         .into_iter()
         .map(|p| PanelRect { x0: p.x0 + x0, y0: p.y0 + y0, x1: p.x1 + x0, y1: p.y1 + y0 })
         .collect();
     let panel_area: usize = panels.iter().map(|p| (p.x1 - p.x0 + 1) * (p.y1 - p.y0 + 1)).sum();
-    let f = Features {
-        panel: panel_area as f32 / total,
-        red: red as f32 / total,
-        bright: bright as f32 / total,
-    };
-    (f, panels)
+    let features = Features { panel: ratio(panel_area, total), red: ratio(red, total), bright: ratio(bright, total) };
+    (features, panels)
 }

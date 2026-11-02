@@ -6,6 +6,7 @@ mod cli;
 mod detect;
 mod export;
 mod model;
+mod num;
 mod preview;
 mod video;
 
