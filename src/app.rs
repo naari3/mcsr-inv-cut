@@ -856,7 +856,9 @@ fn install_japanese_font(ctx: &egui::Context) {
         if let Ok(data) = std::fs::read(dir.join(name)) {
             ctx.add_font(egui::epaint::text::FontInsert::new(
                 "jp",
-                egui::FontData::from_owned(data),
+                // Japanese system fonts render ~0.28 em above center in egui's line
+                // box (measured: 3.5 px high in a 23 px button at body size).
+                egui::FontData::from_owned(data).tweak(egui::FontTweak { y_offset_factor: 0.28, ..Default::default() }),
                 vec![
                     egui::epaint::text::InsertFontFamily {
                         family: egui::FontFamily::Proportional,
