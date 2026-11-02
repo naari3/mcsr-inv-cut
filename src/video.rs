@@ -67,6 +67,11 @@ pub fn probe(path: &Path) -> Result<VideoInfo> {
 /// Presentation timestamps (seconds, absolute) of every video frame, in display order.
 /// Read from packets so no decoding is needed.
 pub fn frame_pts(path: &Path) -> Result<Vec<f64>> {
+    Ok(frame_index(path)?.0)
+}
+
+/// Frame timestamps in display order, and the indices of keyframes among them.
+pub fn frame_index(path: &Path) -> Result<(Vec<f64>, Vec<usize>)> {
     let out = command("ffprobe")
         .args([
             "-v",
@@ -74,7 +79,7 @@ pub fn frame_pts(path: &Path) -> Result<Vec<f64>> {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "packet=pts_time",
+            "packet=pts_time,flags",
             "-of",
             "csv=p=0",
         ])
@@ -84,12 +89,17 @@ pub fn frame_pts(path: &Path) -> Result<Vec<f64>> {
     if !out.status.success() {
         bail!("ffprobe failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    let mut pts: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+    let mut packets: Vec<(f64, bool)> = String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+        .filter_map(|l| {
+            let mut it = l.trim().split(',');
+            let t = it.next()?.parse().ok()?;
+            Some((t, it.next().is_some_and(|f| f.starts_with('K'))))
+        })
         .collect();
-    pts.sort_by(|a, b| a.total_cmp(b));
-    Ok(pts)
+    packets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let keyframes = packets.iter().enumerate().filter(|(_, p)| p.1).map(|(i, _)| i).collect();
+    Ok((packets.into_iter().map(|p| p.0).collect(), keyframes))
 }
 
 /// Output size of the analysis decode: width fixed, aspect kept, even height.
@@ -108,9 +118,16 @@ pub struct FrameReader {
 }
 
 impl FrameReader {
-    pub fn open(path: &Path, width: u32, height: u32) -> Result<Self> {
-        let mut child = command("ffmpeg")
-            .args(["-v", "error", "-nostdin", "-i"])
+    /// Decodes from the start, or from `seek` seconds (relative to the start time;
+    /// accurate, so the first output frame is the first one at or after it).
+    pub fn open(path: &Path, width: u32, height: u32, seek: Option<f64>) -> Result<Self> {
+        let mut cmd = command("ffmpeg");
+        cmd.args(["-v", "error", "-nostdin"]);
+        if let Some(ss) = seek {
+            cmd.args(["-ss", &format!("{:.6}", ss.max(0.0))]);
+        }
+        let mut child = cmd
+            .arg("-i")
             .arg(path)
             .args([
                 "-map",

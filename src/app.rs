@@ -2,8 +2,7 @@ use crate::analysis::{self, AnalysisResult, Progress};
 use crate::detect::{self, PanelRect, Roi};
 use crate::export::{self, CutMode, EncodeOptions};
 use crate::model::{Class, Project, Segment, Stats, fmt_time, segments, stats};
-use crate::video;
-use crossbeam_channel::{Receiver, Sender};
+use crate::preview::{Preview, PreviewFrame, Source};
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,48 +33,13 @@ struct Job {
     handle: Option<JoinHandle<anyhow::Result<JobOutput>>>,
 }
 
-struct PreviewFrame {
-    index: usize,
-    rgb: Vec<u8>,
-    w: u32,
-    h: u32,
-}
-
-/// Decodes requested frames on a background thread. Only the latest request matters.
-struct PreviewWorker {
-    tx: Sender<(PathBuf, video::VideoInfo, usize, f64)>,
-    rx: Receiver<anyhow::Result<PreviewFrame>>,
-}
-
-impl PreviewWorker {
-    fn new(ctx: egui::Context) -> Self {
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<(PathBuf, video::VideoInfo, usize, f64)>();
-        let (res_tx, res_rx) = crossbeam_channel::unbounded();
-        std::thread::spawn(move || {
-            while let Ok(mut req) = req_rx.recv() {
-                while let Ok(newer) = req_rx.try_recv() {
-                    req = newer;
-                }
-                let (path, info, index, pts) = req;
-                let (w, h) = video::analysis_size(&info, analysis::ANALYSIS_WIDTH);
-                let r = video::grab_frame(&path, &info, pts, w, h).map(|rgb| PreviewFrame { index, rgb, w, h });
-                if res_tx.send(r).is_err() {
-                    break;
-                }
-                ctx.request_repaint();
-            }
-        });
-        Self { tx: req_tx, rx: res_rx }
-    }
-}
-
 pub struct App {
     project: Option<Project>,
     classes: Vec<Class>,
     stats: Stats,
     current: usize,
     requested: Option<usize>,
-    preview: PreviewWorker,
+    preview: Preview,
     texture: Option<egui::TextureHandle>,
     shown: Option<PreviewFrame>,
     shown_panels: Vec<PanelRect>,
@@ -102,7 +66,7 @@ impl App {
             stats: Stats::default(),
             current: 0,
             requested: None,
-            preview: PreviewWorker::new(cc.egui_ctx.clone()),
+            preview: Preview::new(cc.egui_ctx.clone()),
             texture: None,
             shown: None,
             shown_panels: Vec::new(),
@@ -165,7 +129,19 @@ impl App {
         self.shown = None;
         self.texture = None;
         self.requested = None;
+        self.open_preview();
         self.recompute();
+    }
+
+    fn open_preview(&mut self) {
+        let Some(p) = &self.project else { return };
+        self.preview.open(Source {
+            path: p.video.clone(),
+            info: p.info.clone(),
+            pts: Arc::new(p.pts.clone()),
+            keyframes: Arc::new(p.keyframes.clone()),
+        });
+        self.requested = None;
     }
 
     fn start_analysis(&mut self) {
@@ -213,6 +189,7 @@ impl App {
                     p.features = r.features;
                     p.analyzed_roi = Some(p.roi);
                 }
+                self.open_preview();
                 self.recompute();
                 self.save();
             }
@@ -233,8 +210,9 @@ impl App {
         if self.requested == Some(self.current) {
             return;
         }
+        let _ = p;
         self.requested = Some(self.current);
-        let _ = self.preview.tx.send((p.video.clone(), p.info.clone(), self.current, p.pts[self.current]));
+        self.preview.request(self.current);
     }
 
     fn receive_preview(&mut self, ctx: &egui::Context) {
@@ -404,8 +382,8 @@ impl App {
             ui.label(format!("{}x{} / {:.3} fps (平均)", p.info.width, p.info.height, p.info.avg_fps));
             ui.label(format!("{} フレーム", p.frame_count()));
             ui.horizontal(|ui| {
-                ui.toggle_value(&mut self.roi_edit, "ROI を描く").on_hover_text("ゲーム画面だけを囲う");
-                if ui.button("ROI を全体に戻す").clicked() {
+                ui.toggle_value(&mut self.roi_edit, "解析範囲を描く").on_hover_text("ゲーム画面だけを囲う");
+                if ui.button("解析範囲を全体に戻す").clicked() {
                     p.roi = Roi::default();
                     roi_changed = true;
                 }
@@ -413,7 +391,7 @@ impl App {
             let analyze_label = if !p.analyzed() {
                 "解析する"
             } else if p.analyzed_roi.is_some_and(|r| r != p.roi) {
-                "ROI を反映して再解析"
+                "解析範囲を反映して再解析"
             } else {
                 "再解析"
             };

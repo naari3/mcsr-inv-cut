@@ -65,6 +65,9 @@ pub struct Project {
     #[serde(default)]
     pub analyzed_roi: Option<Roi>,
     pub pts: Vec<f64>,
+    /// Indices of keyframes in `pts`; used to seek the preview.
+    #[serde(default)]
+    pub keyframes: Vec<usize>,
     pub features: Vec<Features>,
 }
 
@@ -78,7 +81,7 @@ impl Project {
     /// Probes a video and builds an unanalyzed project.
     pub fn from_video(video: &Path) -> anyhow::Result<Self> {
         let info = crate::video::probe(video)?;
-        let pts = crate::video::frame_pts(video)?;
+        let (pts, keyframes) = crate::video::frame_index(video)?;
         anyhow::ensure!(!pts.is_empty(), "フレームが見つからない");
         Ok(Project {
             video: video.to_path_buf(),
@@ -89,6 +92,7 @@ impl Project {
             range: None,
             analyzed_roi: None,
             pts,
+            keyframes,
             features: Vec::new(),
         })
     }
@@ -323,6 +327,7 @@ mod tests {
             range: None,
             analyzed_roi: None,
             pts: (0..10).map(|i| i as f64 / 10.0).collect(),
+            keyframes: vec![],
             features: vec![Features::default(); 10],
         };
         p.set_override(2, 7, Some(Class::Container));
@@ -344,6 +349,7 @@ mod tests {
             range: None,
             analyzed_roi: None,
             pts: (0..10).map(|i| i as f64 / 10.0).collect(),
+            keyframes: vec![],
             features: vec![Features::default(); 10],
         };
         p.set_override(3, 4, Some(Class::Container));

@@ -34,7 +34,7 @@ pub fn run(path: &Path, info: &VideoInfo, roi: Roi, progress: &Progress) -> Resu
     let mut pts = video::frame_pts(path)?;
     progress.total.store(pts.len(), Ordering::Relaxed);
     let (w, h) = video::analysis_size(info, ANALYSIS_WIDTH);
-    let mut reader = FrameReader::open(path, w, h)?;
+    let mut reader = FrameReader::open(path, w, h, None)?;
 
     const BATCH: usize = 48;
     let mut features = Vec::with_capacity(pts.len());

@@ -6,6 +6,7 @@ mod cli;
 mod detect;
 mod export;
 mod model;
+mod preview;
 mod video;
 
 fn main() -> anyhow::Result<()> {
