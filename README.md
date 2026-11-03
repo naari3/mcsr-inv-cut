@@ -1,56 +1,58 @@
 # mcsr-inv-cut
 
-MCSR の録画から、インベントリやチェスト、作業台、かまどなどの画面を開いている区間を拾って、その時間を数えたり、その区間を抜いた動画を書き出したりするやつ。
+Finds the parts of an MCSR recording where you have the inventory, a chest, a crafting table, a furnace and so on open. It tells you how long you spent in them, and can export the video with those parts cut out.
 
-ポーズメニューや設定画面はインベントリとは別扱い (その他GUI) になる。自動判定が外れていたらタイムライン上で直せる。
+Pause and settings screens are counted separately ("other GUI"), not as inventory time. If the detection gets something wrong, you can fix it on the timeline.
 
-## 動かし方
+The UI is in Japanese for now.
 
-ffmpeg と ffprobe に PATH が通っている必要がある。Windows でしか動かしていない。
+## Usage
+
+You need ffmpeg and ffprobe on your PATH. I've only run it on Windows.
 
 ```
 cargo build --release
-target/release/mcsr-inv-cut <動画>
+target/release/mcsr-inv-cut <video>
 ```
 
-動画を開いて (ドラッグ&ドロップでもいい)「解析する」を押す。15 分の 1080p60 で 2〜3 分くらい。
+Open a video (drag and drop works too) and press 解析する (analyze). A 15-minute 1080p60 video takes around 2-3 minutes.
 
-配信の録画みたいにカメラやチャットがゲーム画面に被っている場合は、先に「解析範囲を描く」でゲーム画面だけを囲っておくと誤検出が減る。
+If the recording has a webcam or chat on top of the game, like a stream VOD, use 解析範囲を描く (draw analysis area) first and box just the game. That cuts down on false hits.
 
-解析が終わったら右側に時間が出る。間違っているところはタイムラインで範囲を選んで (Shift+ドラッグかダブルクリック) 数字キーで直す。
+When it's done, the times show up on the right. To fix a mistake, select a range on the timeline (Shift+drag or double-click) and press a number key.
 
-| キー | |
+| Key | |
 |---|---|
-| `1` / `2` / `3` | コンテナGUI / その他GUI / ゲーム画面にする |
-| `0` | 自動判定に戻す |
-| `←` `→` | 1 フレーム移動 (Shift で区間の境目まで) |
-| `I` `O` | 計測範囲の始点 / 終点 |
+| `1` / `2` / `3` | Mark as container GUI / other GUI / gameplay |
+| `0` | Back to auto detection |
+| `←` `→` | Move one frame (with Shift, jump to the next segment edge) |
+| `I` `O` | Set the start / end of the measured range |
 
-結果と手直しは動画の横に `<動画>.mcsrcut.json` として勝手に保存される。
+Results and your fixes are saved automatically next to the video as `<video>.mcsrcut.json`.
 
 ### CLI
 
-GUI を開かずに使うこともできる。
+You can also use it without the GUI.
 
 ```
-mcsr-inv-cut analyze <動画> [--roi x0,y0,x1,y1]
-mcsr-inv-cut report <動画>
-mcsr-inv-cut csv <動画> <out.csv>
-mcsr-inv-cut cut <動画> <out.mp4> [--mode remove-container|remove-gui|only-container] [--crf N] [--preset P]
+mcsr-inv-cut analyze <video> [--roi x0,y0,x1,y1]
+mcsr-inv-cut report <video>
+mcsr-inv-cut csv <video> <out.csv>
+mcsr-inv-cut cut <video> <out.mp4> [--mode remove-container|remove-gui|only-container] [--crf N] [--preset P]
 ```
 
-## どうやって判定しているか
+## How it detects things
 
-インベントリ系の画面は、だいたい #C6C6C6 の灰色の板が真ん中に出て、背景が暗くなる。なので各フレームでその色の塊を探して、ある程度大きい・画面の端に付いていない・縦と横に真っ直ぐな辺がある・周りが暗い、を満たしたらコンテナGUI としている。辺を縦横 1 本ずつしか見ないのは、アイテムの説明 (ツールチップ) が板の端を隠すことがあるから。
+When you open an inventory-type screen, a gray (#C6C6C6) panel shows up in the middle and the background gets darker. So for each frame it looks for blobs of that color. A blob counts as a container GUI if it's fairly large, doesn't touch the edge of the frame, has a straight edge both horizontally and vertically, and the area around it is dark. It only asks for one straight edge in each direction because item tooltips can cover the panel's edges.
 
-ポーズメニューなどは板が出ない代わりに、画面全体が暗くなってハートの赤が消える。板がなくてハートの赤もほとんどない、というフレームをその他GUI にしている。
+Pause menus and the like don't have the panel, but the whole screen darkens and the red of the hearts goes away. Frames with no panel and almost no heart red are counted as other GUI.
 
-詳しくは `src/detect.rs`。
+See `src/detect.rs` for the details.
 
-## うまくいかないケース
+## When it doesn't work
 
-- テクスチャパックで GUI の色が変わっていると拾えない
-- GUI スケールがすごく小さいと拾えないかもしれない
-- 目測用の縦長リサイズなどでハートが画面外に出ると、普通のプレイ画面がその他GUI になる。コンテナGUI の時間には影響しない
+- Texture packs that change the GUI color won't be picked up
+- A very small GUI scale might not be picked up
+- If the hearts go off-screen, e.g. with the tall resize used for eye measuring, normal gameplay gets counted as other GUI. This doesn't affect the container GUI time
 
-試したときの記録は [docs/notes.md](docs/notes.md) に置いてある。
+My notes from testing it are in [docs/notes.md](docs/notes.md) (in Japanese).
